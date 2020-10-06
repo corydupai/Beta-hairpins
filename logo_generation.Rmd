@@ -1,0 +1,336 @@
+---
+title: "Simplified_analysis.Rmd"
+author: "Cory DuBois"
+date: "November 29, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+##Load packages
+```{r}
+require(data.table)
+require(ggplot2)
+require(cowplot)
+require(stringr)
+require(gtools)
+require(stats)
+require(stringi)
+library(parallel)
+library(seqinr)
+
+```
+
+
+#function to get unique substrings
+```{r}
+unique.substrings <- function(dt,l1,cn){
+  
+  counter <- c()
+  
+  for(value in 3:l1){
+    
+    list.out <- stri_match_all_regex(dt[,get(cn)],paste0("(?=(.{",value,"}))"),simplify=FALSE,omit_no_match=TRUE,perl=TRUE)
+    list.out<-unlist(list.out)
+    counter<-c(counter,list.out)
+  }
+  
+  return(counter)
+}
+
+```
+
+#Load data file
+```{r}
+full_seqs <- fread("data_mid/seqs_of_interest.csv")
+descriptions <- fread("pdb_data/compound2020_8_11.tsv")
+anti_ids <- descriptions[grepl("antibod|nanobod|fab|mab|immunoglobulin|scFv|VHH",
+                               description, ignore.case = TRUE),
+                         pdb_id]
+pairs <- fread("data_mid/pair_data_bigger.csv",
+               na.strings=getOption("datatable.na.strings")
+)[!(pdb_id %in% anti_ids)
+][ !grepl("U", full_aa)
+][(nchar(subseq_Beta1)<=14 & nchar(subseq_Beta2)<=14) 
+][touching_u %in% c("YES","NO") &
+    B1_pos != "-" &
+    B2_pos != "-"
+][(nchar(subseq_Beta1)>=4 | nchar(subseq_Beta2)>=4) & nchar(subseq_aa)>=3
+][B1_inner != 3, B1_inner := abs(B1_inner - 3) # Switched values initially, easiest to correct here
+][B2_inner != 3, B2_inner := abs(B2_inner - 3)
+][, beta_type := paste0(B1_inner,B2_inner)
+][,c("id","pdb_id","full_aa","subseq_aa","subseq_Beta1_rev","subseq_Beta1",
+     "subseq_Beta2","touching_u", "beta_type",
+     "B1_inner", "B2_inner")
+][!duplicated(full_aa)] %>%
+  unique()
+
+# seq_aa <- lapply(pairs$full_aa, s2c)
+# write.fasta(sequences = seq_aa,
+#             names = paste0(
+#               gsub(":","_",pairs$id),
+#               "_",
+#               pairs$full_aa),
+#             "data_mid/full_aa.fasta")
+```
+
+
+```{r simplified_aa}
+roi <- "subseq_Beta1_rev"
+pairs[,simp_sec:=gsub("[RHK]","R",get(roi)) #Positive
+       ][,simp_sec:=gsub("[DE]","D",simp_sec) #Negative
+       ][,simp_sec:=gsub("[STNQ]","E",simp_sec) #Polar
+       ][,simp_sec:=gsub("[FYW]","B",simp_sec) #Bulky
+       ][,simp_sec:=gsub("[AVILM]","H",simp_sec) #Hydro
+       ][,simp_sec:=gsub("[CGP]","S",simp_sec) #Special
+       ][,simp_sec:=gsub("E","P",simp_sec) #Positive
+       ][,simp_sec:=gsub("D","N",simp_sec) #Positive
+       ]
+
+```
+
+```{r split_seqs}
+
+full_sig_hits <- pairs[touching_u == "YES"]
+full_sig_misses <- pairs[touching_u == "NO"]
+
+```
+
+#get list of unique peptides of a given length
+```{r}
+process_data <- function(part, hits, misses){
+  
+  mississippi <- unique.substrings(hits,21,part)
+  hits.r.us <- unique.substrings(misses,21,part)
+    
+  print("Factoring misses")
+  miss.counts <- table(factor(mississippi,levels = unique(mississippi),ordered = TRUE))
+  
+  print("Factoring hits")
+  hits.counts <- table(factor(hits.r.us,levels = unique(hits.r.us),ordered = TRUE))
+  
+  print("Making DT's")
+  dt.miss <- data.table(miss.counts)
+  dt.hits <- data.table(hits.counts)
+  
+  remove(mississippi)
+  remove(hits.r.us)
+  
+  colnames(dt.miss) <- c("sub_aa","misses")
+  colnames(dt.hits) <- c("sub_aa","hits")
+  
+  print("Merging DT's")
+  dt.output <- merge(dt.hits,dt.miss, all=TRUE)
+  
+  print("Cleaning DT's")
+  dt.output <- dt.output[sub_aa!=""]
+  dt.output[is.na(misses), misses := 0]
+  dt.output[is.na(hits), hits := 0]
+  
+  
+  len.hits<-nrow(full_sig_hits)
+  len.misses <- nrow(full_sig_misses)
+  
+  print("hits ratio")
+  
+  dt.output[,hits.ratio:=(hits/len.hits)]
+  
+  print("misses ratio")
+  dt.output[,miss.ratio:=(misses/len.misses)]
+  
+  print("chi square dt update")
+  dt.output[,chi.hits.no:=(len.hits-hits)
+          ][,chi.misses.no:=(len.misses-misses)
+          ][miss.ratio == 0, miss.ratio := (1/chi.misses.no)
+          ][, ratio := hits.ratio / miss.ratio]
+  dt.output <- dt.output[ratio <= (2/3) | ratio >= 1.5]
+
+}
+anova_by_row <- function(i,dt){
+  temp_dt <- dt[i,]
+  remove(dt)
+  temp_dt[,"pval":=fisher.test(matrix(c(hits,misses,chi.hits.no,chi.misses.no),nrow=2,ncol=2))$p.value]
+}
+
+
+```
+
+
+```{r}
+
+make_logo <- function(seq,dt, cn_simp, cn_full){
+  logo_dt	<- dt[grepl(seq,get(cn_simp)) & touching_u == "YES"]
+  logo_dt[,col_of_int := substr(get(cn_full),
+                       str_locate(get(cn_simp),seq)[1,1],
+                       str_locate(get(cn_simp),seq)[1,2]), by = get(cn_full)]
+
+  plot_out <-
+    ggseqlogo::ggseqlogo(unlist(logo_dt$col_of_int), method = 'prob') +
+    ggtitle(seq) +
+    theme(axis.line = element_line(colour = "black"),
+            legend.position = "NONE",
+            plot.title = element_text(hjust = 0.5, size = 22))
+  plot_out
+}
+
+```
+
+```{r}
+hydro_aa <- c("A","V","I","L","M")
+bulk_aa <- c("F","Y","W")
+special_aa <- c("C","G","P")
+polar_aa <- c("S","T","N","Q")
+pos_aa <- c("R","H","K")
+neg_aa <- c("D","E")
+
+cs1 <- 
+  ggseqlogo::make_col_scheme(
+  chars=
+    c(hydro_aa,
+      neg_aa,
+      special_aa,
+      polar_aa,
+      pos_aa,
+      bulk_aa),
+  groups =
+    c(rep("Hydrophobic", 5),
+      rep("Negative", 2),
+      rep("Special", 3),
+      rep("Polar", 4),
+      rep("Positive", 3),
+      rep("Bulky Aromatic", 3)),
+  cols =
+    c(rep("grey50", 5),
+      rep("blue", 2),
+      rep("darkgoldenrod", 3),
+      rep("forestgreen", 4),
+      rep("darkorchid", 3),
+      rep("firebrick", 3)),
+  name='')
+
+
+roi2 <- "subseq_Beta2"
+roi3 <- "subseq_Beta1"
+full_sig_hits[, add_spacer := (14-nchar(get(roi)))
+            ][, spacer := ""
+            ][add_spacer > 0, spacer := paste(rep("-",add_spacer), collapse = ""), by = add_spacer
+            ][, goi := paste0(get(roi), spacer)]
+
+full_sig_hits[, add_spacer2 := (14-nchar(get(roi2)))
+            ][, spacer2 := ""
+            ][add_spacer2 > 0, 
+              spacer2 := paste(rep("-",add_spacer2), collapse = ""), 
+              by = add_spacer2
+            ][, goi2 := paste0(get(roi2), spacer2)]
+
+full_sig_hits[, add_spacer3 := (14-nchar(get(roi3)))
+            ][, spacer3 := ""
+            ][add_spacer3 > 0, 
+              spacer3 := paste(rep("-",add_spacer3), collapse = ""), 
+              by = add_spacer3
+            ][, goi3 := paste0( spacer3,get(roi3))]
+
+orientation_1_base <- c(unlist(full_sig_hits[B2_inner == 1,goi2]),
+                   unlist(full_sig_hits[B1_inner == 1,goi3]))
+orientation_2_base <- c(unlist(full_sig_hits[B2_inner == 2,goi2]),
+                   unlist(full_sig_hits[B1_inner == 2,goi3]))
+
+orientation_1_D <- c(unlist(full_sig_hits[grepl("D$", goi2) & B2_inner == 1,goi2]),
+                   unlist(full_sig_hits[grepl("D$", goi3) & B1_inner == 1,goi3]))
+orientation_2_D <- c(unlist(full_sig_hits[grepl("D$", goi2) & B2_inner == 2,goi2]),
+                   unlist(full_sig_hits[grepl("D$", goi3) & B1_inner == 2,goi3]))
+o1b <- 
+  ggseqlogo::ggseqlogo(orientation_1_base,
+                     method = 'prob',
+                     col_scheme = cs1) +
+  scale_x_continuous(breaks = c(1,14),
+                   labels = c("N-term","C-term"))+
+    ggtitle("All Hydrophobic") +
+    theme(axis.line = element_line(colour = "black"),
+            legend.position = "NONE",
+            plot.title = element_text(hjust = 0.5, size = 10)) 
+
+o2b <- 
+  ggseqlogo::ggseqlogo(orientation_2_base,
+                     method = 'prob',
+                     col_scheme = cs1) +
+  ggtitle("All Polar") +
+  scale_x_continuous(breaks = c(1,14),
+                   labels = c("N-term","C-term"))+
+    theme(axis.line = element_line(colour = "black"),
+            legend.position = "NONE",
+            plot.title = element_text(hjust = 0.5, size = 10))
+
+o1D <- 
+  ggseqlogo::ggseqlogo(orientation_1_D,
+                     method = 'prob',
+                     col_scheme = cs1) +
+  ggtitle("D-cap Hydrophobic") +
+  scale_x_continuous(breaks = c(1,14),
+                   labels = c("N-term","C-term"))+
+    theme(axis.line = element_line(colour = "black"),
+            legend.position = "NONE",
+            plot.title = element_text(hjust = 0.5, size = 10))
+
+o2D <- 
+  ggseqlogo::ggseqlogo(orientation_2_D,
+                     method = 'prob',
+                     col_scheme = cs1) +
+  ggtitle("D-cap Polar") +
+  scale_x_continuous(breaks = c(1,14),
+                   labels = c("N-term","C-term"))+
+    theme(axis.line = element_line(colour = "black"),
+            legend.position = "NONE",
+            plot.title = element_text(hjust = 0.5, size = 10))
+
+plot_leg <- ggseqlogo::ggseqlogo(c("ACDEFGHIKLMNPQRSTVWY"), method = "prob",
+                     col_scheme = cs1) +
+  theme(legend.box.margin = margin(0,0,0,0),
+        legend.margin = margin(0,0,0,0),
+        legend.text = element_text(size = 8),
+        legend.title = element_blank(), 
+        legend.direction = "horizontal") +
+  guides(fill = guide_legend(nrow = 1, override.aes = list(size=2)))
+
+plot_leg <- get_legend(plot_leg)
+combod <- 
+  plot_grid(
+    ncol = 1,
+    plot_grid(ncol = 2,
+          o1D,
+          # NULL,
+          o2D,
+          o1b,
+          # NULL,
+          o2b,
+          labels = c("A","","B")),
+          # rel_widths = c(0.475,0.05,0.475)),
+    rel_heights = c(0.97,0.03),
+    plot_leg)
+save_plot("figures/Supp_Fig2.tiff",
+          combod, dpi=300, compression = "lzw")
+
+
+orientation_1_D_tester <- c(unlist(full_sig_hits[grepl("^.D", goi2),goi3]))
+
+o1Dt <- 
+  ggseqlogo::ggseqlogo(orientation_1_D_tester,
+                     method = 'prob',
+                     col_scheme = cs1) +
+  ggtitle("D-cap Hydrophobic") +
+  scale_x_continuous(breaks = c(1,8),
+                   labels = c("N-term","C-term"))+
+    theme(axis.line = element_line(colour = "black"),
+            legend.position = "NONE",
+            plot.title = element_text(hjust = 0.5, size = 10))
+
+```
+
