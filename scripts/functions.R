@@ -32,17 +32,9 @@ count_contacts <- function(row_pos,
       pdb_main <- unlist(strsplit(unlist(
         strsplit(pdb_main,
                  "_atom_site.pdbx_PDB_model_num \n"))[2],"#"))[1]
-      #CHECK HERE!!!!!!!!!!!!
       pdb_main <- gsub("\\?[[:space:]]+\\?[[:space:]]+\\?[[:space:]]+\\?[[:space:]]+\\?[[:space:]]+\\?","?", pdb_main, fixed=FALSE)
       pdb_main <- unique(fread(pdb_main)[,!c("V1","V2","V7","V14","V15",
                                            "V16","V18","V20")])
-      
-      # if(length(colnames(pdb_main))>15){
-      #   # print(pdb_ID)
-      #   pdb_main <- pdb_main[,!c("V17","V19","V21","V23","V25")]
-      #   # print(pdb_main)
-      # }
-      
       
       colnames(pdb_main)<-c("TypeA","TypeB","Period",
                             "AA","Chain2", "Position_true",
@@ -59,9 +51,9 @@ count_contacts <- function(row_pos,
           )[, acc := as.numeric(acc)
           ][, Position := as.character(Position)
           ][, Chain := as.character(Chain)]
-          }, warning = function(w) {
-            dt[ , touching_u:="NO DSSP"]
-            return(dt)
+          # }, warning = function(w) {
+          #   dt[ , touching_u:="NO DSSP"]
+          #   return(dt)
           }, error = function(e) {
             dt[ , touching_u:="NO DSSP"]
             return(dt)
@@ -71,7 +63,7 @@ count_contacts <- function(row_pos,
         return(dt)
       }
  
-      pdb_main <- merge(pdb_main,access[,c("Position","acc","Chain")],by=c("Position","Chain"))
+      pdb_main <- merge(pdb_main,access[,c("Position","acc","Chain","TCO","KAPPA","ALPHA","PHI","PSI")],by=c("Position","Chain"))
       setorder(pdb_main, Position_true)
 
       #lists to convert 3 letter amino acids to 1 letter
@@ -109,7 +101,7 @@ count_contacts <- function(row_pos,
                                ][(TypeB=="CA" & AA=="G")|(TypeB=="CB")]
 
     pdb_file <- pdb_main[Chain==chainz] 
-    xyz <- as.data.table(t(colMeans(pdb_file[,c("X","Y","Z")])))
+    # xyz <- as.data.table(t(colMeans(pdb_file[,c("X","Y","Z")])))
     
     #Counter for non-standard residues not in list
     let3 <- pdb_file[nchar(AA)>1,AA]
@@ -136,7 +128,14 @@ count_contacts <- function(row_pos,
       B1 <- nchar(B_start) # Length of N-term beta sheet
       l_prot <- nchar(protein) # Length of beta hairpin
       B2 <- (l_prot-n_B_end)+1 # Start of C-term beta sheet
-
+      Turn_start <- B1 + 1
+      Turn_end <- B2 - 1
+      turn_pdb <- pdb_file[Turn_start:Turn_end]
+      dt[, PHI := list(unlist(turn_pdb$PHI))
+        ][ , PSI := list(unlist(turn_pdb$PSI))
+        ][ , ALPHA := list(unlist(turn_pdb$ALPHA))
+        ][ , KAPPA := list(unlist(turn_pdb$KAPPA))
+        ][ , TCO := list(unlist(turn_pdb$TCO))]
       # get mean accessibility for odd and even residues from start
       for(v in 1:2){
         
@@ -495,4 +494,321 @@ sec_str_location <-
     return(dt2)
     
   }
+
+
+aa_breakdown <- function(hairpins_dt){
+  hydro_aa <- c("A","V","I","L","M")
+  bulk_aa <- c("F","Y","W")
+  special_aa <- c("C","G","P")
+  polar_aa <- c("S","T","N","Q")
+  pos_aa <- c("R","H","K")
+  neg_aa <- c("D","E")
+  hairpins_dt %>%
+    filter(!grepl("3",beta_type)) %>%
+    mutate(B1_correct = stri_reverse(subseq_Beta1),
+           turn_length = nchar(subseq_aa),
+           turn_type = paste0("turn_", turn_length, 
+                              "_", beta_type)) %>%
+    separate(B1_correct,
+             paste0("B1_",c(1:14)),
+             remove = FALSE,
+             sep = c(1:13)
+    ) %>%
+    separate(subseq_Beta2,
+             paste0("B2_",c(1:14)),
+             remove = FALSE,
+             sep = c(1:13)
+    ) %>%
+    separate(subseq_aa,
+             paste0("turn_",c(1:5)),
+             remove = FALSE,
+             sep = c(1:5)
+    ) %>%
+    pivot_longer(c(paste0("B1_",c(1:14)),
+                   paste0("B2_",c(1:14)),
+                   paste0("turn_",c(1:5))),
+                 names_to = "structure",
+                 values_to = "amino_acid") %>%
+    filter(amino_acid != "") %>%
+    mutate(B1_inner = if_else(B1_inner == 1,
+                              "Pol",
+                              "Hydro"),
+           B2_inner = if_else(B2_inner == 1,
+                              "Pol",
+                              "Hydro")) %>%
+    mutate(B1_inner = paste0("N-term ",B1_inner),
+           B2_inner = paste0("C-term ",B2_inner),
+           turn_length = paste0("T ",turn_length)) %>%
+    pivot_longer(c(turn_length, B1_inner, B2_inner),
+                 names_to = "sub_thing",
+                 values_to = "sub_pos") %>%
+    filter(str_remove(structure, "_.*") ==
+             str_remove(sub_thing, "_.*")) %>%
+    tabyl(structure, amino_acid, sub_pos,
+          show_missing_levels = FALSE)%>%
+    adorn_totals("col", name = "TOTES") %>%
+    adorn_percentages("row") %>%
+    adorn_pct_formatting(digits = 3,
+                         affix_sign = FALSE) %>%
+    rbindlist(idcol = TRUE, fill = TRUE) %>%
+    select(-X) %>%
+    pivot_longer(cols = c("A":"Y"),
+                 names_to = "AA",
+                 values_to = "Perc") %>%
+    mutate(color_code = str_remove(structure,"_[1-9]|_[1-9][1-9]"),
+           turn_type = .id,
+           .id = NULL,
+           Perc = as.numeric(Perc)) %>%
+    mutate(AA_group = case_when(
+      AA %in% hydro_aa ~ "Hydro",
+      AA %in% special_aa ~ "Special",
+      AA %in% bulk_aa ~ "Bulky",
+      AA %in% polar_aa ~ "Polar",
+      AA %in% neg_aa ~ "Negative",
+      TRUE ~ "Positive"
+    ),
+    AA_simpler = if_else(
+      AA_group %in% c("Negative","Positive"),
+      "Charged",
+      AA_group
+    ),
+    AA_simpler = factor(AA_simpler,
+                        levels = c(
+                          "Bulky",
+                          "Hydro",
+                          "Polar",
+                          "Charged",
+                          "Special"
+                        )),
+    AA = fct_relevel(AA, names(color_pal)),
+    structure = str_replace(structure,"B1_","N"),
+    structure = str_replace(structure,"B2_","C"),
+    structure = str_replace(structure,"turn_",""),
+    structure = fct_relevel(structure, hairpin_levels),
+    turn_type = fct_relevel(turn_type,
+                            c("N-term Pol",
+                              "N-term Hydro",
+                              "T 1",
+                              "T 2",
+                              "T 3",
+                              "T 4",
+                              "T 5",
+                              "C-term Pol",
+                              "C-term Hydro")))
+}
+
+# Get counts for residues at specific turn positions for given subtypes
+turn_breakdown <- function(hairpins_dt){
+  hydro_aa <- c("A","V","I","L","M")
+  bulk_aa <- c("F","Y","W")
+  special_aa <- c("C","G","P")
+  polar_aa <- c("S","T","N","Q")
+  pos_aa <- c("R","H","K")
+  neg_aa <- c("D","E")
+  aa_list <- c("A","C","D","E","F",
+               "G","H","I","K","L",
+               "M","N","P","Q","R",
+               "S","T","V","W","Y")
+  hairpins_dt %>%
+    filter(!grepl("3",beta_type)) %>%
+    mutate(turn_length = nchar(subseq_aa),
+           turn_size = paste0("turn_", turn_length, "_", turn_type)) %>%
+    separate(subseq_aa,
+             paste0("turn_",c(1:5)),
+             remove = FALSE,
+             sep = c(1:5)
+    ) %>%
+    pivot_longer(c(paste0("turn_",c(1:5))),
+                 names_to = "structure",
+                 values_to = "amino_acid") %>%
+  filter(amino_acid != "") %>%
+  mutate(turn_length = paste0("T ",turn_length)) %>%
+  tabyl(structure, amino_acid, turn_size,
+        show_missing_levels = FALSE) %>%
+    adorn_totals("col", name = "TOTES") %>%
+    rbindlist(idcol = TRUE, fill = TRUE) %>%
+    pivot_longer(cols = all_of(c(aa_list)),
+                 names_to = "AA",
+                 values_to = "Perc") %>%
+    mutate(color_code = str_remove(structure,"_[1-9]|_[1-9][1-9]"),
+           turn_type = .id,
+           .id = NULL,
+           Perc = as.numeric(Perc),
+           Perc = if_else(is.na(Perc),
+                          0, Perc/TOTES)) %>%
+    mutate(AA_group = case_when(
+      AA %in% hydro_aa ~ "Hydro",
+      AA %in% special_aa ~ "Special",
+      AA %in% bulk_aa ~ "Bulky",
+      AA %in% polar_aa ~ "Polar",
+      AA %in% neg_aa ~ "Negative",
+      TRUE ~ "Positive"
+    ),
+    AA_simpler = if_else(
+      AA_group %in% c("Negative","Positive"),
+      "Charged",
+      AA_group
+    ),
+    AA_simpler = factor(AA_simpler,
+                        levels = c(
+                          "Bulky",
+                          "Hydro",
+                          "Polar",
+                          "Charged",
+                          "Special"
+                        )),
+    structure = str_remove(structure,"turn_"),
+    turn_subtype = str_remove(turn_type, "turn_._"),
+    full_turn_info = turn_type,
+    turn_type = str_match(turn_type, "turn_."),
+    AA = fct_relevel(AA, names(color_pal)))
+ 
+}
+
+# This function takes a formatted DT with PHI and PSI angles for residues in a turn
+# region and classifies the type of turn based on existing nomenclature. Assumes 1 residue
+# turns are actually gamma, 2 residue turns are Beta, and 3 residue turns are alpha turns 
+# respectively.
+classify_turns <- function(turn_dt){
+  
+  turn_number <- c(1:5)
+  turn_names_1 <- c("Gamma_normal","Gamma_inverse")
+  turn_names_2 <- c("Beta_I", "Beta_I'", "Beta_II", "Beta_II`", "Beta_VIa1", "Beta_VIa2", "Beta_VIb", "Beta_VIII")
+  turn_names_4 <- c("Beta_I", "Beta_I'", "Beta_II", "Beta_II`", "Beta_VIa1", "Beta_VIa2", "Beta_VIb", "Beta_VIII")
+  turn_names_5 <- c("Alpha_I_RS",
+                    "Alpha_I_LS",
+                    "Alpha_II_RS",
+                    "Alpha_II_LS",
+                    "Alpha_I_RU",
+                    "Alpha_I_LU",
+                    "Alpha_II_RU",
+                    "Alpha_II_LU",
+                    "Alpha_I_C")
+  turn_names_3 <- turn_names_5
+  turn_names <- list(turn_names_1,
+                     turn_names_2,
+                     turn_names_3,
+                     turn_names_4,
+                     turn_names_5)
+  
+  turn_dt <-  turn_dt %>%
+    mutate(turn_type = 
+             case_when(
+               turn_length == 1 ~ "Gamma_other",
+               turn_length == 2 ~ "Beta_IV",
+               turn_length == 3 ~ "Alpha_Other",
+               turn_length == 4 ~ "Beta_IV",
+               turn_length == 5 ~ "Alpha_Other"))
+  for( tn in  turn_number ){
+    
+    for( turn_classifier_position in 1:length(turn_names[[tn]])){
+      name_out <- turn_names[[tn]][turn_classifier_position]
+      
+      # BETA
+      if(tn == 4 | tn == 2 ){
+        PHI_4_2_list <- c(-60, 60, -60, 60, -60, -120, -135, -60)[turn_classifier_position]
+        PSI_4_2_list <- c(-30, 30, 120, -120, 120, 120, 135, -30)[turn_classifier_position]
+        PHI_4_3_list <- c(-90, 90, 80, -80, -90, -60, -75, -120)[turn_classifier_position]
+        PSI_4_3_list <- c(0, 0, 0, 0, 0, 0, 160, 120)[turn_classifier_position]
+        
+        PHI_4_2_low <- min(PHI_4_2_list-45, PHI_4_2_list+45)
+        PHI_4_2_high <- max(PHI_4_2_list-45, PHI_4_2_list+45)
+        PSI_4_2_low <- min(PSI_4_2_list-45, PSI_4_2_list+45)
+        PSI_4_2_high <- max(PSI_4_2_list-45, PSI_4_2_list+45)
+        PHI_4_3_low <- min(PHI_4_3_list-45, PHI_4_3_list+45)
+        PHI_4_3_high <- max(PHI_4_3_list-45, PHI_4_3_list+45)
+        PSI_4_3_low <- min(PSI_4_3_list-45, PSI_4_3_list+45)
+        PSI_4_3_high <- max(PSI_4_3_list-45, PSI_4_3_list+45)
+        if(tn == 4){
+          turn_dt <- turn_dt %>%
+            mutate(turn_type = if_else(
+              turn_length == tn &
+                PHI_2 >= PHI_4_2_low & PHI_2 <= PHI_4_2_high &
+                PSI_2 >= PSI_4_2_low & PSI_2 <= PSI_4_2_high & 
+                PHI_3 >= PHI_4_3_low & PHI_3 <= PHI_4_3_high &
+                PSI_3 >= PSI_4_3_low & PSI_3 <= PSI_4_3_high,
+              name_out,
+              turn_type))
+        } else {
+          turn_dt <- turn_dt %>%
+            mutate(turn_type = if_else(
+              turn_length == tn &
+                PHI_1 >= PHI_4_2_low & PHI_1 <= PHI_4_2_high &
+                PSI_1 >= PSI_4_2_low & PSI_1 <= PSI_4_2_high & 
+                PHI_2 >= PHI_4_3_low & PHI_2 <= PHI_4_3_high &
+                PSI_2 >= PSI_4_3_low & PSI_2 <= PSI_4_3_high,
+              name_out,
+              turn_type))
+        }
+      # GAMMA  
+      } else if (tn == 1){
+        PHI_4_2_list <- c(75, -79)[turn_classifier_position]
+        PSI_4_2_list <- c(-64, 69)[turn_classifier_position]
+        
+        PHI_4_2_low <- min(PHI_4_2_list-45, PHI_4_2_list+45)
+        PHI_4_2_high <- max(PHI_4_2_list-45, PHI_4_2_list+45)
+        PSI_4_2_low <- min(PSI_4_2_list-45, PSI_4_2_list+45)
+        PSI_4_2_high <- max(PSI_4_2_list-45, PSI_4_2_list+45)
+        turn_dt <- turn_dt %>%
+          mutate(turn_type = if_else(
+            turn_length == tn &
+              PHI_1 >= PHI_4_2_low & PHI_1 <= PHI_4_2_high &
+              PSI_1 >= PSI_4_2_low & PSI_1 <= PSI_4_2_high,
+            name_out,
+            turn_type))
+      # ALPHA  
+      } else if (tn == 5 | tn == 3) {
+        PHI_2_list <- c(-60, 48, -69, 53, 59, -61, 54, -65, -103)[turn_classifier_position]
+        PSI_2_list <- c(-29, 42, 129, -137, -157, 158, 39, -20, 143)[turn_classifier_position]
+        PHI_3_list <- c(-72, 67, 88, -95, -67, 64, 67, -90, -85)[turn_classifier_position]
+        PSI_3_list <- c(-29, 33, -16, 81, -29, 37, -5, 16, 2)[turn_classifier_position]
+        PHI_4_list <- c(-96, 70, -91, 57, -68, 62, -125, 86, -54)[turn_classifier_position]
+        PSI_4_list <- c(-20, 32, -32, 38, -39, 39, -34, 37, -39)[turn_classifier_position]
+        
+        PHI_2_low <- min(PHI_2_list-45, PHI_2_list+45)
+        PHI_2_high <- max(PHI_2_list-45, PHI_2_list+45)
+        PSI_2_low <- min(PSI_2_list-45, PSI_2_list+45)
+        PSI_2_high <- max(PSI_2_list-45, PSI_2_list+45)
+        PHI_3_low <- min(PHI_3_list-45, PHI_3_list+45)
+        PHI_3_high <- max(PHI_3_list-45, PHI_3_list+45)
+        PSI_3_low <- min(PSI_3_list-45, PSI_3_list+45)
+        PSI_3_high <- max(PSI_3_list-45, PSI_3_list+45)
+        PHI_4_low <- min(PHI_4_list-45, PHI_4_list+45)
+        PHI_4_high <- max(PHI_4_list-45, PHI_4_list+45)
+        PSI_4_low <- min(PSI_4_list-45, PSI_4_list+45)
+        PSI_4_high <- max(PSI_4_list-45, PSI_4_list+45)
+        
+        if(tn == 5){
+          turn_dt <- turn_dt %>%
+            mutate(turn_type = if_else(
+              turn_length == tn &
+                PHI_2 >= PHI_2_low & PHI_2 <= PHI_2_high &
+                PSI_2 >= PSI_2_low & PSI_2 <= PSI_2_high & 
+                PHI_3 >= PHI_3_low & PHI_3 <= PHI_3_high &
+                PSI_3 >= PSI_3_low & PSI_3 <= PSI_3_high &
+                PHI_4 >= PHI_4_low & PHI_4 <= PHI_4_high &
+                PSI_4 >= PSI_4_low & PSI_4 <= PSI_4_high,
+              name_out,
+              turn_type))
+        } else {
+          turn_dt <- turn_dt %>%
+            mutate(turn_type = if_else(
+              turn_length == tn &
+                PHI_1 >= PHI_2_low & PHI_1 <= PHI_2_high &
+                PSI_1 >= PSI_2_low & PSI_1 <= PSI_2_high & 
+                PHI_2 >= PHI_3_low & PHI_2 <= PHI_3_high &
+                PSI_2 >= PSI_3_low & PSI_2 <= PSI_3_high &
+                PHI_3 >= PHI_4_low & PHI_3 <= PHI_4_high &
+                PSI_3 >= PSI_4_low & PSI_3 <= PSI_4_high,
+              name_out,
+              turn_type))
+        }
+        
+        
+      }
+      
+    }
+  }
+  return(turn_dt)
+}
 

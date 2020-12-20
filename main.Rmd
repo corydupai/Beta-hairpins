@@ -23,14 +23,8 @@ library(tidytext)
 library(ggforce)
 library(ggrepel)
 library(RColorBrewer)
-# library(ggtree)
-# library(treeio)
-# library(tidygraph)
-# library(tidytree)
-# library(ggraph)
 library(gtools)
 require(tidyverse)
-# library(lemon)
 theme_set(theme_cowplot(12))
 
 cbbPalette <- c( "#E69F00", "#56B4E9","#999999", "#009E73","#000000", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
@@ -47,15 +41,53 @@ vio_pal <- c("Hydrophobic" = "grey50",
 
 ```
 
+```{r make_color_pal, include=FALSE}
+
+hydro_aa <- c("A","V","I","L","M")
+bulk_aa <- c("F","Y","W")
+special_aa <- c("C","G","P")
+polar_aa <- c("S","T","N","Q")
+pos_aa <- c("R","H","K")
+neg_aa <- c("D","E")
+
+hydro_pal <- rev(brewer.pal( length(hydro_aa) + 1, "Greys"))[1:(length(hydro_aa))]
+neg_pal <- rev(brewer.pal( length(neg_aa)  + 1, "Blues"
+                       ))[1:(length(neg_aa))]
+special_pal <- (brewer.pal(length(special_aa)  + 5, "BrBG"
+                       ))[1:(length(special_aa))]
+polar_pal <- rev(brewer.pal( length(polar_aa) + 1, "Greens"))[1:(length(polar_aa))]
+pos_pal <- rev(brewer.pal( length(pos_aa)+ 1, "Purples"
+                           ))[1:(length(pos_aa))]
+bulk_pal <- rev(brewer.pal( length(bulk_aa) + 1, "Reds"
+                           ))[1:( length(bulk_aa))]
+
+color_pal <- 
+  c(hydro_pal,
+    bulk_pal,
+    special_pal,
+    polar_pal,
+    pos_pal,
+    neg_pal)
+
+names(color_pal) <- 
+  c(hydro_aa,
+    bulk_aa,
+    special_aa,
+    polar_aa,
+    pos_aa,
+    neg_aa)
+```
+
 ```{r load_data, include = FALSE}
 source("scripts/functions.R")
+ss_data_in <- "data_mid/pair_data_bigger.csv"
 
 # Load in data and do some filtering/formatting
 descriptions <- fread("pdb_data/compound2020_8_11.tsv") # Pdb descriptions
 anti_ids <- descriptions[grepl("antibod|nanobod|fab|mab|immunoglobulin|scFv|VHH", # Filter some descriptions, mostly antibody related
                                description, ignore.case = T), 
                          pdb_id]
-pairs <- fread("data_mid/pair_data_bigger.csv",
+pairs <- fread(ss_data_in,
                na.strings=getOption("datatable.na.strings")
 )[!(pdb_id %in% anti_ids)
 ][ !grepl("U", full_aa) # Get rid of nonstandard aa U
@@ -69,6 +101,7 @@ pairs <- fread("data_mid/pair_data_bigger.csv",
 
 pairs[,B1_pos_from_turn := abs(as.numeric(B1_pos)-nchar(subseq_Beta1)-1) # Calculate position from turn for each amino acid in a beta strand
       ][,B2_pos_from_end := abs(as.numeric(B2_pos)-nchar(subseq_Beta2)-1)] # Calculate position from end for each amino acid in a beta strand
+
 ```
 
 ```{r save_data, include = FALSE}
@@ -90,7 +123,8 @@ seqs_save[, aa_sequence := full_aa
           ][, contacting_faces := touching_u]
 
 fwrite(
-  seqs_save[,c("aa_sequence",
+  seqs_save[,c("id",
+               "aa_sequence",
                 "secondary_str",
                 "seq_start", 
                 "seq_stop",
@@ -102,16 +136,20 @@ pairs_save <-
   unique(
     pairs[,
           c("id",
-            # "full_aa",
-            # "full_ss",
-            # "full_start",
-            # "full_stop",
-            # "touching_u",
+            "full_aa",
+            "full_ss",
+            "full_start",
+            "full_stop",
+            "touching_u",
             "distances",
             "pairs",
             "B1_pos_from_turn",
             "B2_pos"
-            )])
+            )])[, aa_sequence := full_aa
+          ][, secondary_str := full_ss
+          ][, seq_start := full_start
+          ][, seq_stop := full_stop
+          ][, contacting_faces := touching_u]
 
 fwrite(
   pairs_save,
@@ -119,18 +157,82 @@ fwrite(
   )
 ```
 
-```{r contact_distributions, include = FALSE}
+```{r manipulate_dataframes, include = FALSE}
 pairs[,pair1:=substring(pairs,1,1),by=pairs][,pair2:=substring(pairs,2,2),by=pairs]
 pairs <- pairs[touching_u=="YES"]
+uni_hairpins <- unique(pairs[,c("id", "full_aa", "full_ss",
+                                "subseq_aa", "subseq_Beta1", "subseq_Beta2",
+                                "touching_u", "B1_inner", "B2_inner",
+                                "beta_type")])
+```
+
+```{r load_and_format_angles_dt}
+turn_ss_dt <- 
+  unique(
+    pairs[,c("id", "full_aa", "full_ss",
+             "subseq_aa", "subseq_ss",
+             "touching_u","beta_type")]
+    )[!grepl("X", full_aa)]
+turn_ss_dt[, hidden_space := "NO",
+    ][, turn_length := nchar(subseq_aa)
+    ][ turn_length != nchar(subseq_ss), hidden_space := "YES"
+    ][, turn_type := "Mixed"
+    ][grepl("T", subseq_ss) & 
+        !grepl("S", subseq_ss) & 
+        hidden_space != "YES",
+      turn_type := "Bonded"
+    ][grepl("S", subseq_ss) & 
+        !grepl("T", subseq_ss),
+      turn_type := "Bend"
+    ][, DSSP_type := turn_type]
+table(turn_ss_dt$turn_type)
+
+# Loads and formats dt containing angle info
+angles_in <- fread("data_mid/angles_info.csv"
+                   )[PSI > 180, PSI := 360-PSI
+                   ][PHI > 180, PHI := 360-PHI
+                   ][touching_u == "YES"
+                   ]
+
+angles_in <- angles_in %>%
+  select(-Letter) %>%
+  unique() %>%
+  pivot_wider(names_from = t_res_num,
+              values_from = c("PSI","PHI","ALPHA","KAPPA","TCO"),
+              names_glue = "{.value}_{t_res_num}") %>%
+  left_join(unique(turn_ss_dt[grepl("Bonded", DSSP_type)][,c("id", "subseq_aa", "beta_type")])) %>%
+  filter(!grepl("3",beta_type) & !is.na(beta_type)) # Remove sequences with odd beta strand contacts or missing contacts
+
+angles_in <- classify_turns(angles_in)
+angles_counts <- turn_breakdown(angles_in)
+```
+
+```{r}
+# USE THIS GUY
+beta_turn_plot <-
+  ggplot(angles_counts %>% filter(TOTES >= 100 )) + #& grepl("turn_4",turn_type)
+  geom_col( aes(x = structure, y = Perc, fill = AA)) +
+  facet_grid(AA_group ~ full_turn_info, scales = "free_x") +
+  scale_fill_manual(values = color_pal)
+
+angles_out <- angles_counts %>%
+  mutate(Perc = Perc * 100) %>%
+  select(AA, Perc, "Turn Length" = turn_type, "Turn Type" = turn_subtype,"Turn Position" = structure, "Number of Hairpin structures" = TOTES) %>%
+  pivot_wider(names_from = AA,
+              values_from = Perc) %>%
+  relocate(A:Y, .after = `Turn Position`) %>%
+  relocate(M, .after = L) %>%
+  relocate(W, .before = Y) %>%
+  mutate(`Turn Length` = str_remove(`Turn Length`, "turn_"),
+         `Turn Type` = str_replace(`Turn Type`, "_", " "))
+
+
+fwrite(angles_out, "data/AA_frequency_by_type.csv")
+```
+
+```{r contact_distributions, include = FALSE}
 
 contact_pairs <- dipept_count(pairs)
-
-hydro_aa <- c("A","V","I","L","M")
-bulk_aa <- c("F","Y","W")
-special_aa <- c("C","G","P")
-polar_aa <- c("S","T","N","Q")
-pos_aa <- c("R","H","K")
-neg_aa <- c("D","E")
 
 aa_types <- c("H","B","S","pol","pos","neg")
 aa_pairs <- permutations(6,2,aa_types,repeats.allowed = FALSE)
@@ -170,9 +272,6 @@ polars <- c("polpol","polneg","pospol")
 special_pairs <- c("SS","SH","SB","HH","HB","BB")
 special_polar <- c("Spos","Sneg","Spol")
 same_charge <- c("negneg","pospos")
-# 
-# sec_hydro <- c(pol_hydro,"SH","HH")
-# sec_pol <- c("polpol","Spol")
 
 contact_pairs[pairtype%in%pol_hydro, pair_fact:="Polar/Charged | Hydrophobic"
             ][pairtype%in%polars, pair_fact:="Polar | Polar/Charged"
@@ -180,9 +279,6 @@ contact_pairs[pairtype%in%pol_hydro, pair_fact:="Polar/Charged | Hydrophobic"
             ][pairtype%in%c(same_charge,"posneg"), pair_fact:="Charged x2"
             ][pairtype%in%special_polar,pair_fact:="Special | Polar/Charged"
             ]
-# [pairtype %in% charges_bulk, pair_fact := "Polar/Charged | Bulky"]
-
- # & !grepl("3",id)
 
 cp2 <- contact_pairs %>%
   filter(factor_var=="Full") %>%
@@ -234,18 +330,12 @@ fullish_supp <-
             x = typeB,
             y = ratio)) +
   geom_violin(colour = "black")+
-    # scale = "count",
-              # aes(colour = typeB)) +
   geom_sina(
-    # aes(colour = col_lab,
-    #     fill = col_lab),
     aes(colour = typeB,
         fill = typeB),
             alpha = 0.4,
             size = 2,
             shape = 21
-            # position = "identity",
-            # method = "counts"
             ) +
   scale_y_continuous(name = "log2( Observed / Expected )") +
   scale_colour_manual(values = vio_pal ) +
@@ -253,8 +343,6 @@ fullish_supp <-
   geom_text_repel(data =
                cp2 %>% filter(abs(ratio) >=1),
              aes(
-               # x=pair_fact,
-               # x = typeA,
                  y=ratio,
                  label=AA),
              force = 3)+
@@ -304,36 +392,8 @@ fullish <-
   coord_flip() +
   NULL
 
-# sub_fullish <-
-#   ggplot( data = cp2 %>% filter(pair_fact %in% c("Charged x2")),
-#           aes(x = pair_fact,
-#               y = ratio)) +
-#   geom_violin(fill = NA) +
-#   geom_sina(aes(colour = col_lab,
-#                 fill = col_lab),
-#             alpha = 0.4,
-#             size = 2,
-#             shape = 21,
-#             position = "identity",
-#             method = "counts") +
-#   scale_y_continuous(name = "Observed / Expected") +
-#   scale_colour_manual(values = c("Reg" = "grey50",
-#                                  "Up" = "darkred")) +
-#   scale_fill_manual(values = c("Reg" = "grey50",
-#                                  "Up" = "darkred")) +
-#   geom_text_repel(data =
-#                cp2 %>% filter(abs(ratio) >=1 & pair_fact == "Charged x2"),
-#              aes(x=pair_fact,
-#                  y=ratio,
-#                  label=AA),
-#              force = 2)+
-#   geom_hline(yintercept = 0, linetype = 2) +
-#   theme(legend.position = "None",
-#         axis.title.y = element_blank()) +
-#   coord_flip()
-
 save_plot(
-  "figures/Fig4.tiff",
+  "figures/Fig5.tiff",
   fullish,
   base_height = 5,
   base_width = 6, dpi=300, compression = "lzw")
@@ -343,21 +403,10 @@ save_plot(
   fullish_supp,
   base_height = 6,
   base_width = 9, dpi=300, compression = "lzw")
-# 
-# save_plot(
-#   "figures/sub_aa_pairs.tiff",
-#   sub_fullish,
-#   base_height = 3,
-#   base_width = 6)
 
 ```
 
 ```{r aa_distribution_by_region, include = FALSE}
-uni_hairpins <- unique(pairs[,c("id", "full_aa", "full_ss",
-                                "subseq_aa", "subseq_Beta1", "subseq_Beta2",
-                                "touching_u", "B1_inner", "B2_inner",
-                                "beta_type")])
-
 full_lib <- fread("data_mid/seqs_of_interest.csv")[, c("id","aa_seq")
                                                    ][, beta_type := "Control"]
 
@@ -481,34 +530,6 @@ save_plot(
 #   base_width = 4.5)
 ```
 
-```{r make_color_pal, include=FALSE}
-hydro_pal <- rev(brewer.pal( length(hydro_aa) + 1, "Greys"))[1:(length(hydro_aa))]
-neg_pal <- rev(brewer.pal( length(neg_aa)  + 1, "Blues"
-                       ))[1:(length(neg_aa))]
-special_pal <- (brewer.pal(length(special_aa)  + 5, "BrBG"
-                       ))[1:(length(special_aa))]
-polar_pal <- rev(brewer.pal( length(polar_aa) + 1, "Greens"))[1:(length(polar_aa))]
-pos_pal <- rev(brewer.pal( length(pos_aa)+ 1, "Purples"
-                           ))[1:(length(pos_aa))]
-bulk_pal <- rev(brewer.pal( length(bulk_aa) + 1, "Reds"
-                           ))[1:( length(bulk_aa))]
-
-color_pal <- 
-  c(hydro_pal,
-    bulk_pal,
-    special_pal,
-    polar_pal,
-    pos_pal,
-    neg_pal)
-
-names(color_pal) <- 
-  c(hydro_aa,
-    bulk_aa,
-    special_aa,
-    polar_aa,
-    pos_aa,
-    neg_aa)
-```
 
 ```{r aa_distribution_by_position, include=FALSE}
 
@@ -710,100 +731,6 @@ bad_breakdown <- uni_hairpins %>%
 
 ```{r breakdown_regions, include=FALSE}
 
-aa_breakdown <- function(hairpins_dt){
-  hairpins_dt %>%
-  filter(!grepl("3",beta_type)) %>%
-  mutate(B1_correct = stri_reverse(subseq_Beta1),
-         turn_length = nchar(subseq_aa),
-         turn_type = paste0("turn_", turn_length, 
-                            "_", beta_type)) %>%
-  separate(B1_correct,
-           paste0("B1_",c(1:14)),
-           remove = FALSE,
-           sep = c(1:13)
-  ) %>%
-  separate(subseq_Beta2,
-           paste0("B2_",c(1:14)),
-           remove = FALSE,
-           sep = c(1:13)
-  ) %>%
-  separate(subseq_aa,
-           paste0("turn_",c(1:5)),
-           remove = FALSE,
-           sep = c(1:5)
-  ) %>%
-  pivot_longer(c(paste0("B1_",c(1:14)),
-                 paste0("B2_",c(1:14)),
-                 paste0("turn_",c(1:5))),
-               names_to = "structure",
-               values_to = "amino_acid") %>%
-  filter(amino_acid != "") %>%
-  mutate(B1_inner = if_else(B1_inner == 1,
-                            "Pol",
-                            "Hydro"),
-         B2_inner = if_else(B2_inner == 1,
-                            "Pol",
-                            "Hydro")) %>%
-  mutate(B1_inner = paste0("N-term ",B1_inner),
-         B2_inner = paste0("C-term ",B2_inner),
-         turn_length = paste0("T ",turn_length)) %>%
-  pivot_longer(c(turn_length, B1_inner, B2_inner),
-               names_to = "sub_thing",
-               values_to = "sub_pos") %>%
-  filter(str_remove(structure, "_.*") ==
-           str_remove(sub_thing, "_.*")) %>%
-  tabyl(structure, amino_acid, sub_pos,
-        show_missing_levels = FALSE)%>%
-  adorn_totals("col", name = "TOTES") %>%
-  adorn_percentages("row") %>%
-  adorn_pct_formatting(digits = 3,
-                       affix_sign = FALSE) %>%
-  rbindlist(idcol = TRUE, fill = TRUE) %>%
-  select(-X) %>%
-  pivot_longer(cols = c("A":"Y"),
-               names_to = "AA",
-               values_to = "Perc") %>%
-  mutate(color_code = str_remove(structure,"_[1-9]|_[1-9][1-9]"),
-         turn_type = .id,
-         .id = NULL,
-         Perc = as.numeric(Perc)) %>%
-  mutate(AA_group = case_when(
-           AA %in% hydro_aa ~ "Hydro",
-           AA %in% special_aa ~ "Special",
-           AA %in% bulk_aa ~ "Bulky",
-           AA %in% polar_aa ~ "Polar",
-           AA %in% neg_aa ~ "Negative",
-           TRUE ~ "Positive"
-         ),
-         AA_simpler = if_else(
-           AA_group %in% c("Negative","Positive"),
-           "Charged",
-           AA_group
-         ),
-         AA_simpler = factor(AA_simpler,
-                             levels = c(
-                               "Bulky",
-                               "Hydro",
-                               "Polar",
-                               "Charged",
-                               "Special"
-                             )),
-         AA = fct_relevel(AA, names(color_pal)),
-         structure = str_replace(structure,"B1_","N"),
-         structure = str_replace(structure,"B2_","C"),
-         structure = str_replace(structure,"turn_",""),
-         structure = fct_relevel(structure, hairpin_levels),
-         turn_type = fct_relevel(turn_type,
-                                 c("N-term Pol",
-                                   "N-term Hydro",
-                                   "T 1",
-                                   "T 2",
-                                   "T 3",
-                                   "T 4",
-                                   "T 5",
-                                   "C-term Pol",
-                                   "C-term Hydro")))
-}
 breakdown <- aa_breakdown(uni_hairpins)
 simplified <- breakdown %>%
   group_by(structure, turn_type, AA_simpler) %>%
@@ -962,28 +889,60 @@ save_plot(
   base_height = 9,
   base_width = 14, dpi=300, compression = "lzw"
 )
-# save_plot(
-#   "figures/bad_aa_pos_dist.tiff",
-#   bad_aa_dist,
-#   base_height = 6,
-#   base_width = 9)
-# 
-# save_plot(
-#   "figures/aa_pos_sub.tiff",
-#   aa_dist_sub,
-#   base_height = 6,
-#   base_width = 9)
-# 
-# save_plot(
-#   "figures/aa_long_sub.tiff",
-#   aa_long_sub,
-#   base_height = 6,
-#   base_width = 9)
+```
 
+```{r sec_structure_differences, include = FALSE}
+
+counterzzz <- turn_breakdown(turn_ss_dt) %>%
+  mutate(turn_type = str_remove(turn_type, "turn_"),
+         turn_type = paste0(turn_type, " ", turn_subtype),
+         width = if_else(grepl(" 1", turn_type), 10, 1))
+
+# This adds some space around the 1 turn column
+filler_plot <- data.frame(structure = c(0,2), 
+                          Perc = 40, 
+                          AA_simpler = "Charged", 
+                          turn_type = "1 Bend", 
+                          AA = "R")
+ss_turn_plot <-
+  ggplot(counterzzz %>% filter(TOTES >= 100)) +
+  geom_col( aes(x = structure, y = Perc*100, 
+                fill = AA,
+              group = AA)) +
+  geom_point(data = filler_plot, aes(x = structure, y = Perc), size = 15, colour = "white", alpha = 0)+
+  facet_grid(AA_simpler ~ turn_type, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = color_pal) + 
+  scale_y_continuous(expand = c(0,0), name = "Frequency") +
+  # scale_x_discrete(expand = c(1,1))+
+  # scale_x_discrete(breaks = c(0,1,1.5,2,3,4,5), labels = c("",1, "", 2, 3, 4, 5))+
+  theme(legend.position = "None",
+        axis.line = element_blank(),
+      panel.border = element_rect(colour = "black",
+                                  fill = NA),
+      panel.spacing.y=unit(1, "lines"))
+
+save_plot(
+  "figures/Fig4.tiff",
+  plot_grid(
+    ncol = 2,
+    ss_turn_plot,
+    plot_grid(
+      ncol = 1,
+      leg_bulk,
+      leg_hydro,
+      leg_pol,
+      leg_charged,
+      leg_spec),
+    rel_widths = 
+      c(0.95,
+        0.05)),
+  base_height = 9,
+  base_width = 14, dpi=300, compression = "lzw"
+)
 ```
 
 ```{r alignment_stuff}
-pairs2 <- fread("data_mid/pair_data.csv",
+pairs2 <- fread("data_mid/pair_data_bigger.csv",
                na.strings=getOption("datatable.na.strings")
 )[!(pdb_id %in% anti_ids)
 ][touching_u %in% c("YES","NO") &
@@ -997,30 +956,6 @@ pairs2 <- fread("data_mid/pair_data.csv",
 ][,c("id","pdb_id","full_aa","subseq_aa","subseq_Beta1_rev","subseq_Beta2","touching_u", "beta_type","full_type")
 ][!duplicated(full_aa)] %>%
   unique()
-# 
-# tree_tibble <- as_tibble(tree.in) %>%
-#   mutate(id = gsub("[[:alpha:]]*$","",label),
-#          id = gsub("_$","",id),
-#          id = gsub("_",":", id),
-#          full_aa = gsub(".*_","",label)) %>%
-#   left_join(unique(pairs2)) %>%
-#   mutate(beta_type = if_else(is.na(beta_type),
-#                              "ignore",
-#                              beta_type),
-#          )
-# 
-# yes_tips <- tree_tibble %>%
-#   filter(grepl("3",beta_type) | touching_u == "YES" ) %>%
-#   select(label) %>%
-#   unlist()
-# 
-# tree.out <- as.treedata(tree_tibble) %>%
-#   treeio::drop.tip(yes_tips)
-# 
-# 
-# ggtree(tree.out) +
-#   geom_tippoint(aes(color = beta_type))
-
 
 ```
 
@@ -1065,15 +1000,6 @@ phyl.out <- merge(dist_phyls, phyl.id, by = c("name")) %>%
 
 phyl.out[is.na(Kingdom), Kingdom := "No data"]
 pairs3 <- merge(pairs2, phyl.out, by="pdb_id", all.x = TRUE) 
-# %>%
-#   filter(!grepl("3",beta_type) & touching_u == "YES") %>%
-#   group_by(full_type, Kingdom) %>%
-#   summarize(counts = n()) %>%
-#   ungroup() %>%
-#   group_by(full_type) %>%
-#   mutate(totes = sum(counts)) %>%
-#   ungroup() %>%
-#   mutate(rel_counts = counts/totes)
 
 euk_aa1 <- aa_count(pairs3[touching_u=="YES" & Kingdom == "Eukaryota"],
                     quote(subseq_aa),"subseq_aa")[,Kingdom := "Eukaryota"]
@@ -1102,7 +1028,7 @@ arch_aa2 <- aa_count(pairs3[touching_u=="YES" & Kingdom == "Archaea"],
                      quote(subseq_Beta1_rev),"subseq_Beta1_rev")[,Kingdom := "Archaea"]
 arch_aa3 <- aa_count(pairs3[touching_u=="YES" & Kingdom == "Archaea"],
                      quote(subseq_Beta2),"subseq_Beta2")[,Kingdom := "Archaea"]
-# b2_aa <- aa_count(pairs3[touching_u=="YES"],quote(subseq_Beta2),"subseq_Beta2")
+
 control_aa <- aa_count(full_lib,quote(aa_seq), "aa_seq")[,Kingdom := "Control"]
 
 outtie2 <- rbind(euk_aa1,
@@ -1135,7 +1061,6 @@ outtie2 <- rbind(euk_aa1,
                         ))) %>%
   as.data.table()
 
-# outtie2 <- outtie2[!grepl("3",beta_type)]
 outtie2[,totes:=sum(overall_freq),by=.(Kingdom,fact3)
        ][,overall_freq:=100*overall_freq/totes
          ]
@@ -1164,20 +1089,6 @@ outtie2 <- merge(outtie2,innie) %>%
            "Polar/Charged",
            AA_group
          ))
-
-# outtie2 <- outtie2 %>%
-#   mutate(bt2 = case_when(
-#     beta_type == 11 ~ "Polar Polar",
-#     beta_type == 12 ~ "Polar Hydro",
-#     beta_type == 21 ~ "Hydro Polar",
-#     beta_type == 22 ~ "Hydro Hydro"))
-
-# outtie_simple <- outtie2 %>%
-#   filter(beta_type != "Control") %>%
-#   mutate(n_AA = overall_freq*totes)%>%
-#   group_by(Kingdom, Dipept) %>%
-#   summarize(totes = sum(unique(totes)),
-#             overall_freq = sum(n_AA)/totes)
 
 domain_plot <- ggplot(outtie2%>% filter(Kingdom != "Control"), aes(x = fact3, y = overall_freq, fill = Kingdom)) +
   geom_col(position = "dodge",
